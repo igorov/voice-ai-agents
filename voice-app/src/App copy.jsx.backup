@@ -1,0 +1,286 @@
+import { useEffect, useRef, useState } from 'react'
+import './App.css'
+
+function App() {
+  const [wsUrl, setWsUrl] = useState('ws://localhost:8000/ws')
+  const [connected, setConnected] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [logs, setLogs] = useState([])
+  const [error, setError] = useState('')
+
+  const wsRef = useRef(null)
+  const recordingRef = useRef(false)
+  const mediaStreamRef = useRef(null)
+  const inputContextRef = useRef(null)
+  const processorRef = useRef(null)
+  const outputContextRef = useRef(null)
+  const nextPlayTimeRef = useRef(0)
+
+  const INPUT_RATE = 16000
+  const OUTPUT_RATE = 24000
+
+  const log = (line) => {
+    setLogs((prev) => [line, ...prev].slice(0, 200))
+  }
+
+  const base64FromInt16 = (int16) => {
+    const bytes = new Uint8Array(int16.buffer)
+    let binary = ''
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i])
+    }
+    return btoa(binary)
+  }
+
+  const int16FromBase64 = (b64) => {
+    const binary = atob(b64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return new Int16Array(bytes.buffer)
+  }
+
+  const resample = (float32, fromRate, toRate) => {
+    if (fromRate === toRate) return float32
+    const ratio = fromRate / toRate
+    const newLength = Math.round(float32.length / ratio)
+    const result = new Float32Array(newLength)
+    for (let i = 0; i < newLength; i++) {
+      const origin = i * ratio
+      const left = Math.floor(origin)
+      const right = Math.min(left + 1, float32.length - 1)
+      const frac = origin - left
+      result[i] = float32[left] * (1 - frac) + float32[right] * frac
+    }
+    return result
+  }
+
+  const floatToInt16 = (float32) => {
+    const int16 = new Int16Array(float32.length)
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]))
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+    }
+    return int16
+  }
+
+  const playPcm16 = (int16) => {
+    if (!outputContextRef.current) return
+    const ctx = outputContextRef.current
+    const float32 = new Float32Array(int16.length)
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 0x8000
+    }
+    const buffer = ctx.createBuffer(1, float32.length, ctx.sampleRate)
+    buffer.getChannelData(0).set(float32)
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(ctx.destination)
+    const startTime = Math.max(ctx.currentTime, nextPlayTimeRef.current)
+    source.start(startTime)
+    nextPlayTimeRef.current = startTime + buffer.duration
+  }
+  const ensureOutputContext = async () => {
+    if (!outputContextRef.current) {
+      outputContextRef.current = new AudioContext({ sampleRate: OUTPUT_RATE })
+      nextPlayTimeRef.current = outputContextRef.current.currentTime
+    }
+    if (outputContextRef.current.state === 'suspended') {
+      await outputContextRef.current.resume()
+    }
+  }
+
+  const connect = () => {
+    if (wsRef.current) return
+    setError('')
+    const ws = new WebSocket(wsUrl)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      setConnected(true)
+      log('WS connected')
+      ensureOutputContext()
+      ws.send(
+        JSON.stringify({
+          type: 'session.update',
+          session: {
+            type: 'realtime',
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+          },
+        }),
+      )
+    }
+
+    ws.onclose = () => {
+      setConnected(false)
+      setRecording(false)
+      wsRef.current = null
+      log('WS disconnected')
+    }
+
+    ws.onerror = () => {
+      setError('WS error')
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data)
+        if (msg.type === 'response.output_audio.delta' && msg.delta) {
+          const int16 = int16FromBase64(msg.delta)
+          playPcm16(int16)
+        } else if (msg.type === 'response.audio.delta' && msg.delta) {
+          const int16 = int16FromBase64(msg.delta)
+          playPcm16(int16)
+        } else if (msg.type === 'tool_call.executing') {
+          log(`🔧 Llamando herramienta: ${msg.name}(${msg.arguments})`)
+        } else if (msg.type === 'tool_call.done') {
+          log(`✅ Resultado: ${msg.output}`)
+        } else if (msg.type === 'error') {
+          log(`Error: ${msg.error?.message || 'unknown'}`)
+        } else {
+          log(msg.type || 'event')
+        }
+      } catch (e) {
+        log('Non-JSON message')
+      }
+    }
+  }
+
+  const disconnect = () => {
+    if (wsRef.current) {
+      wsRef.current.close()
+    }
+  }
+
+  const startRecording = async () => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setError('Conecta el WebSocket primero')
+      return
+    }
+    setError('')
+    await ensureOutputContext()
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    mediaStreamRef.current = stream
+    const ctx = new AudioContext()
+    inputContextRef.current = ctx
+    const source = ctx.createMediaStreamSource(stream)
+    const processor = ctx.createScriptProcessor(4096, 1, 1)
+    processorRef.current = processor
+
+    processor.onaudioprocess = (e) => {
+      if (!recordingRef.current || !wsRef.current) return
+      const input = e.inputBuffer.getChannelData(0)
+      const resampled = resample(input, ctx.sampleRate, INPUT_RATE)
+      const int16 = floatToInt16(resampled)
+      const b64 = base64FromInt16(int16)
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: b64,
+        }),
+      )
+    }
+
+    source.connect(processor)
+    processor.connect(ctx.destination)
+    recordingRef.current = true
+    setRecording(true)
+    log('Recording started')
+  }
+
+  const stopRecording = async () => {
+    recordingRef.current = false
+    setRecording(false)
+    if (processorRef.current) {
+      processorRef.current.disconnect()
+      processorRef.current.onaudioprocess = null
+      processorRef.current = null
+    }
+    if (inputContextRef.current) {
+      await inputContextRef.current.close()
+      inputContextRef.current = null
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop())
+      mediaStreamRef.current = null
+    }
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && recordingRef.current !== false) {
+      wsRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+      setTimeout(() => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'response.create',
+            }),
+          )
+        }
+      }, 200)
+    }
+    log('Recording stopped')
+  }
+
+  useEffect(() => {
+    return () => {
+      disconnect()
+    }
+  }, [])
+
+  return (
+    <div className="container">
+      <h1>Voice Agent Client</h1>
+      <p className="muted">
+        Conecta al backend WebSocket y prueba audio de ida y vuelta.
+      </p>
+
+      <div className="panel">
+        <label>
+          WebSocket URL
+          <input
+            value={wsUrl}
+            onChange={(e) => setWsUrl(e.target.value)}
+            placeholder="ws://localhost:8000/ws"
+          />
+        </label>
+
+        <div className="row">
+          <button onClick={connect} disabled={connected}>
+            Conectar
+          </button>
+          <button onClick={disconnect} disabled={!connected}>
+            Desconectar
+          </button>
+        </div>
+
+        <div className="row">
+          <button onClick={startRecording} disabled={!connected || recording}>
+            Start
+          </button>
+          <button onClick={stopRecording} disabled={!recording}>
+            Stop &amp; Send
+          </button>
+        </div>
+
+        {error && <div className="error">{error}</div>}
+        <div className="status">
+          Estado: {connected ? 'conectado' : 'desconectado'} ·{' '}
+          {recording ? 'grabando' : 'idle'}
+        </div>
+      </div>
+
+      <div className="panel log">
+        <div className="log-title">Eventos</div>
+        <div className="log-list">
+          {logs.map((l, i) => (
+            <div key={i} className="log-item">
+              {l}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export default App
