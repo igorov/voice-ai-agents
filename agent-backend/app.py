@@ -15,10 +15,10 @@ from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore
 from langchain_openai import OpenAIEmbeddings
 
-from tools import create_retrieve_context_tool
-from prompt import INSTRUCTIONS_V2
+from tools import load_neon_tools, get_all_tools, create_retrieve_context_tool
+from prompt import INSTRUCTIONS
 
-logger = logging.getLogger("realtime-agent-v2")
+logger = logging.getLogger("realtime-agent-v3")
 
 OPENAI_WS_BASE = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-4o-realtime-preview"
@@ -62,7 +62,15 @@ def _init_qdrant() -> QdrantVectorStore | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init Qdrant RAG tool and build tool registry."""
+    """Startup: connect to Neon MCP (if configured), init Qdrant, and build tool registry."""
+    mcp_tools = []
+    try:
+        mcp_tools, _ = await load_neon_tools()
+        if mcp_tools:
+            logger.info("Neon MCP connected — %d tool(s) available", len(mcp_tools))
+    except Exception as exc:
+        logger.warning("Failed to connect to Neon MCP: %s. Continuing without MCP tools.", exc)
+
     rag_tool = None
     try:
         qdrant_store = _init_qdrant()
@@ -72,7 +80,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Failed to initialize Qdrant RAG tool: %s. Continuing without it.", exc)
 
-    all_tools = [rag_tool] if rag_tool is not None else []
+    all_tools = get_all_tools(mcp_tools or None, rag_tool=rag_tool)
     _build_tool_registry(all_tools)
     logger.info("Tool registry ready: %s", [t["name"] for t in TOOL_DEFINITIONS])
 
@@ -138,12 +146,12 @@ async def websocket_proxy(ws: WebSocket):
         logger.exception("Failed to connect to OpenAI Realtime: %s", exc)
         return
 
-    # Send session.update with RAG tool and instructions
+    # Send session.update with tools and instructions
     session_update = {
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": INSTRUCTIONS_V2,
+            "instructions": INSTRUCTIONS,
             "tools": TOOL_DEFINITIONS,
             "tool_choice": "auto",
         },
@@ -166,7 +174,7 @@ async def websocket_proxy(ws: WebSocket):
                         event = json.loads(msg["text"])
                         if event.get("type") == "session.update":
                             session = event.setdefault("session", {})
-                            session["instructions"] = INSTRUCTIONS_V2
+                            session["instructions"] = INSTRUCTIONS
                             session["tools"] = TOOL_DEFINITIONS
                             session["tool_choice"] = "auto"
                             session.setdefault("type", "realtime")
@@ -175,7 +183,7 @@ async def websocket_proxy(ws: WebSocket):
                             session.pop("input_audio_format", None)
                             session.pop("output_audio_format", None)
                             await openai_ws.send(json.dumps(event))
-                            logger.info("Merged tools into client session.update")
+                            logger.info("Merged tools into client session.update: %s", json.dumps(event, ensure_ascii=False))
                             continue
                     except (json.JSONDecodeError, TypeError):
                         pass
