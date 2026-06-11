@@ -21,7 +21,7 @@ from prompt import INSTRUCTIONS_V2
 logger = logging.getLogger("realtime-agent-v2")
 
 OPENAI_WS_BASE = "wss://api.openai.com/v1/realtime"
-DEFAULT_MODEL = "gpt-4o-realtime-preview"
+DEFAULT_MODEL = "gpt-realtime-1.5"
 
 # --- Tool registry (populated at startup) ---------------------------------- #
 
@@ -130,7 +130,7 @@ async def websocket_proxy(ws: WebSocket):
     try:
         openai_ws = await websockets.connect(
             _get_openai_url(),
-            extra_headers=_get_openai_headers(),
+            additional_headers=_get_openai_headers(),
             max_size=16 * 1024 * 1024,
         )
     except Exception as exc:
