@@ -21,7 +21,7 @@ from prompt import INSTRUCTIONS
 logger = logging.getLogger("realtime-agent-v3")
 
 OPENAI_WS_BASE = "wss://api.openai.com/v1/realtime"
-DEFAULT_MODEL = "gpt-4o-realtime-preview"
+DEFAULT_MODEL = "gpt-realtime"
 
 # --- Tool registry (populated at startup) ---------------------------------- #
 
@@ -40,7 +40,7 @@ def _build_tool_registry(tools: list) -> None:
             "description": t.description,
             "parameters": {
                 "type": "object",
-                "properties": t.args,
+                "properties": t.get_input_schema().model_json_schema().get("properties", {}),
             },
         }
         for t in tools
@@ -138,7 +138,7 @@ async def websocket_proxy(ws: WebSocket):
     try:
         openai_ws = await websockets.connect(
             _get_openai_url(),
-            extra_headers=_get_openai_headers(),
+            additional_headers=_get_openai_headers(),
             max_size=16 * 1024 * 1024,
         )
     except Exception as exc:
@@ -154,6 +154,15 @@ async def websocket_proxy(ws: WebSocket):
             "instructions": INSTRUCTIONS,
             "tools": TOOL_DEFINITIONS,
             "tool_choice": "auto",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 16000},
+                    "turn_detection": None,
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                },
+            },
         },
     }
     await openai_ws.send(json.dumps(session_update))
@@ -178,6 +187,15 @@ async def websocket_proxy(ws: WebSocket):
                             session["tools"] = TOOL_DEFINITIONS
                             session["tool_choice"] = "auto"
                             session.setdefault("type", "realtime")
+                            session["audio"] = {
+                                "input": {
+                                    "format": {"type": "audio/pcm", "rate": 16000},
+                                    "turn_detection": None,
+                                },
+                                "output": {
+                                    "format": {"type": "audio/pcm", "rate": 24000},
+                                },
+                            }
                             session.pop("modalities", None)
                             session.pop("voice", None)
                             session.pop("input_audio_format", None)
