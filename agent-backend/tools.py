@@ -43,6 +43,21 @@ def create_retrieve_context_tool(qdrant_store):
 
 logger = logging.getLogger("tools")
 
+# Read-only Neon MCP tools relevant for a voice agent. The Neon MCP server exposes
+# ~34 tools (including destructive ones), which degrades tool selection and latency.
+DEFAULT_NEON_TOOLS = [
+    "run_sql",
+    "get_database_tables",
+    "describe_table_schema",
+    "describe_project",
+]
+
+
+def _allowed_neon_tools() -> set[str]:
+    raw = os.getenv("NEON_TOOLS", "")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    return set(names or DEFAULT_NEON_TOOLS)
+
 
 async def load_neon_tools() -> tuple[list, object | None]:
     """Connect to Neon MCP and return (tools, client). Returns ([], None) if NEON_API_KEY is not set."""
@@ -63,7 +78,15 @@ async def load_neon_tools() -> tuple[list, object | None]:
         }
     )
     tools = await client.get_tools()
-    return tools, client
+    allowed = _allowed_neon_tools()
+    filtered = [t for t in tools if t.name in allowed]
+    logger.info(
+        "Neon MCP exposed %d tool(s); keeping %d: %s",
+        len(tools),
+        len(filtered),
+        [t.name for t in filtered],
+    )
+    return filtered, client
 
 
 def get_all_tools(mcp_tools: list | None = None, rag_tool=None) -> list:

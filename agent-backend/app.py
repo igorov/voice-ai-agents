@@ -23,10 +23,63 @@ logger = logging.getLogger("realtime-agent-v3")
 OPENAI_WS_BASE = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-realtime"
 
+# The Realtime API only supports 24kHz PCM. Client-side VAD is handled by the
+# frontend, so server turn detection is disabled.
+AUDIO_CONFIG = {
+    "input": {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "noise_reduction": {"type": "near_field"},
+        "turn_detection": None,
+    },
+    "output": {
+        "format": {"type": "audio/pcm", "rate": 24000},
+    },
+}
+
 # --- Tool registry (populated at startup) ---------------------------------- #
 
 TOOLS_BY_NAME: dict = {}
 TOOL_DEFINITIONS: list = []
+
+
+def _tool_parameters(tool) -> dict:
+    """Return the full JSON schema of a tool's arguments, as expected by the Realtime API."""
+    schema = getattr(tool, "args_schema", None)
+    if isinstance(schema, dict):
+        json_schema = dict(schema)
+    else:
+        json_schema = tool.get_input_schema().model_json_schema()
+
+    json_schema = _inline_refs(json_schema)
+    json_schema.pop("title", None)
+    json_schema.pop("$schema", None)
+    json_schema["type"] = "object"
+    json_schema.setdefault("properties", {})
+    json_schema.setdefault("required", [])
+    return json_schema
+
+
+def _inline_refs(schema: dict) -> dict:
+    """Resolve local $ref pointers against $defs so the schema is self-contained."""
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+
+    def resolve(node, seen: frozenset):
+        if isinstance(node, list):
+            return [resolve(item, seen) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            key = ref.split("/")[-1]
+            if key in seen:
+                return {"type": "object"}
+            target = defs.get(key)
+            if target is not None:
+                merged = {k: v for k, v in node.items() if k != "$ref"}
+                return {**resolve(target, seen | {key}), **resolve(merged, seen)}
+        return {k: resolve(v, seen) for k, v in node.items() if k not in ("$defs", "definitions")}
+
+    return resolve(schema, frozenset())
 
 
 def _build_tool_registry(tools: list) -> None:
@@ -38,10 +91,7 @@ def _build_tool_registry(tools: list) -> None:
             "type": "function",
             "name": t.name,
             "description": t.description,
-            "parameters": {
-                "type": "object",
-                "properties": t.get_input_schema().model_json_schema().get("properties", {}),
-            },
+            "parameters": _tool_parameters(t),
         }
         for t in tools
     ]
@@ -50,10 +100,10 @@ def _build_tool_registry(tools: list) -> None:
 def _init_qdrant() -> QdrantVectorStore | None:
     """Initialize Qdrant vector store. Returns None if credentials are not set."""
     qdrant_url = os.getenv("QDRANT_URL")
-    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY") or os.getenv("QDRANT_KEY")
     collection_name = os.getenv("QDRANT_COLLECTION_NAME", "documents")
     if not qdrant_url or not qdrant_api_key:
-        logger.info("QDRANT_URL or QDRANT_API_KEY not set — skipping RAG tool")
+        logger.info("QDRANT_URL or QDRANT_API_KEY/QDRANT_KEY not set — skipping RAG tool")
         return None
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -154,15 +204,7 @@ async def websocket_proxy(ws: WebSocket):
             "instructions": INSTRUCTIONS,
             "tools": TOOL_DEFINITIONS,
             "tool_choice": "auto",
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": 16000},
-                    "turn_detection": None,
-                },
-                "output": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
-                },
-            },
+            "audio": AUDIO_CONFIG,
         },
     }
     await openai_ws.send(json.dumps(session_update))
@@ -187,15 +229,7 @@ async def websocket_proxy(ws: WebSocket):
                             session["tools"] = TOOL_DEFINITIONS
                             session["tool_choice"] = "auto"
                             session.setdefault("type", "realtime")
-                            session["audio"] = {
-                                "input": {
-                                    "format": {"type": "audio/pcm", "rate": 16000},
-                                    "turn_detection": None,
-                                },
-                                "output": {
-                                    "format": {"type": "audio/pcm", "rate": 24000},
-                                },
-                            }
+                            session["audio"] = AUDIO_CONFIG
                             session.pop("modalities", None)
                             session.pop("voice", None)
                             session.pop("input_audio_format", None)
@@ -227,7 +261,10 @@ async def websocket_proxy(ws: WebSocket):
                     continue
 
                 event_type = event.get("type", "")
-                logger.info("OpenAI event: %s", event_type)
+                if event_type.endswith(".delta"):
+                    logger.debug("OpenAI event: %s", event_type)
+                else:
+                    logger.info("OpenAI event: %s", event_type)
 
                 if event_type == "session.updated":
                     tools_count = len(event.get("session", {}).get("tools", []))

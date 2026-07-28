@@ -24,11 +24,17 @@ function App() {
   const silenceTimerRef = useRef(null)
   const hasSpokenRef = useRef(false)
   const aiSpeakingRef = useRef(false)
+  const pendingSamplesRef = useRef(0)
+  const responseActiveRef = useRef(false)
 
-  const INPUT_RATE = 16000
+  // La Realtime API solo acepta PCM de 24 kHz, tanto de entrada como de salida.
+  const INPUT_RATE = 24000
   const OUTPUT_RATE = 24000
   const SPEECH_THRESHOLD = 0.008 // 0.015
+  // Umbral más alto para interrumpir a la IA y evitar que el eco la corte.
+  const BARGE_IN_THRESHOLD = 0.03
   const SILENCE_DURATION_MS = 800
+  const MIN_COMMIT_SAMPLES = INPUT_RATE / 5 // 200 ms (el mínimo del API es 100 ms)
 
   const log = (line) => {
     setLogs((prev) => [line, ...prev].slice(0, 200))
@@ -88,6 +94,16 @@ function App() {
 
   const commitAndRespond = () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+    if (pendingSamplesRef.current < MIN_COMMIT_SAMPLES) {
+      log('Audio insuficiente — no se envía')
+      return
+    }
+    if (responseActiveRef.current) {
+      log('Respuesta en curso — no se envía')
+      return
+    }
+    pendingSamplesRef.current = 0
+    responseActiveRef.current = true
     wsRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
     wsRef.current.send(JSON.stringify({ type: 'response.create' }))
     log('Silencio detectado — enviando...')
@@ -95,7 +111,9 @@ function App() {
 
   const interruptAi = () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    wsRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+    if (responseActiveRef.current) {
+      wsRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+    }
     cancelPlayback()
     setAiSpeaking(false)
     aiSpeakingRef.current = false
@@ -180,19 +198,26 @@ function App() {
           aiSpeakingRef.current = true
           const int16 = int16FromBase64(msg.delta)
           playPcm16(int16)
-        } else if (msg.type === 'response.audio.done') {
+        } else if (
+          msg.type === 'response.audio.done' ||
+          msg.type === 'response.output_audio.done'
+        ) {
           setAiSpeaking(false)
           aiSpeakingRef.current = false
+        } else if (msg.type === 'response.created') {
+          responseActiveRef.current = true
         } else if (msg.type === 'tool_call.executing') {
           log(`Llamando herramienta: ${msg.name}(${msg.arguments})`)
         } else if (msg.type === 'tool_call.done') {
           log(`Resultado: ${msg.output}`)
         } else if (msg.type === 'error') {
+          responseActiveRef.current = false
           log(`Error: ${msg.error?.message || 'unknown'}`)
         } else if (
           msg.type === 'response.done' ||
           msg.type === 'response.cancelled'
         ) {
+          responseActiveRef.current = false
           setAiSpeaking(false)
           aiSpeakingRef.current = false
         } else {
@@ -220,7 +245,13 @@ function App() {
     }
     setError('')
     await ensureOutputContext()
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
     mediaStreamRef.current = stream
     const ctx = new AudioContext()
     inputContextRef.current = ctx
@@ -234,7 +265,11 @@ function App() {
 
       // Client-side VAD: detect speech vs silence
       const rms = getRms(input)
-      const speaking = rms > SPEECH_THRESHOLD
+      // Mientras la IA habla se exige más volumen para no confundir el eco con voz.
+      const threshold = aiSpeakingRef.current
+        ? BARGE_IN_THRESHOLD
+        : SPEECH_THRESHOLD
+      const speaking = rms > threshold
 
       if (speaking) {
         // User started or continues speaking
@@ -268,6 +303,7 @@ function App() {
       // Always send audio to OpenAI
       const resampled = resample(input, ctx.sampleRate, INPUT_RATE)
       const int16 = floatToInt16(resampled)
+      pendingSamplesRef.current += int16.length
       const b64 = base64FromInt16(int16)
       wsRef.current.send(
         JSON.stringify({
@@ -290,6 +326,7 @@ function App() {
     setUserSpeaking(false)
     isSpeakingRef.current = false
     hasSpokenRef.current = false
+    pendingSamplesRef.current = 0
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current)
       silenceTimerRef.current = null
